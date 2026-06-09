@@ -11,11 +11,17 @@ name: Docker build
 # everything else via the Docker CLI that ships pre-installed on
 # ubuntu-latest. buildx, login, push, metadata, all native commands.
 #
-# Strategy:
-#   - linux/amd64 publishes unconditionally (binfmt not required).
-#   - linux/arm64 publishes when binfmt installs cleanly (best-effort).
-#   - On binfmt install failure, the workflow still publishes amd64 with a
-#     ::warning:: annotation; arm64 catches up on the next push.
+# Strategy (per-arch digest build + manifest merge):
+#   - linux/amd64 builds natively and pushes by digest unconditionally (the
+#     required leg). Publishing and the GitHub Release depend only on this.
+#   - linux/arm64 builds under QEMU emulation and pushes by digest best-effort,
+#     wrapped in `timeout` so a slow/hung emulated build can never stall the job.
+#   - A manifest list is then assembled from whatever digests exist (multi-arch
+#     when arm64 finished, amd64-only otherwise) and tagged via `imagetools`.
+#   - Build cache is keyed per arch (scope=amd64 / scope=arm64), so once main
+#     warms the cache, tag builds restore arm64 fast instead of rebuilding it.
+#   This replaced a single `--platform amd64,arm64 --push` that hung 30m on tag
+#   refs (cold cache -> full emulated arm64 rebuild) and lost the release.
 
 on:
   push:
@@ -40,7 +46,12 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 40m headroom: amd64 ~4m + arm64 best-effort capped at 15m + manifest merge
+    # + smoke + release. The arm64 cap (see below) means the job can never hang
+    # the way the single multi-arch push did on tag refs (run 26716392993).
+    timeout-minutes: 40
+    env:
+      IMAGE: ghcr.io/m4xx101/cryptex-oss
     permissions:
       # `contents: write` is required by the softprops/action-gh-release@v2
       # step on tag pushes (which calls POST /repos/.../releases). Without
@@ -87,7 +98,7 @@ jobs:
       - name: Resolve image tags
         id: tags
         run: |
-          IMG="ghcr.io/m4xx101/cryptex-oss"
+          IMG="$IMAGE"
           SHA_SHORT="${GITHUB_SHA:0:7}"
           # Bash array of full image:tag strings.
           declare -a TAGS
@@ -119,57 +130,111 @@ jobs:
           fi
           TAGS+=("${IMG}:sha-${SHA_SHORT}")
 
-          # Emit buildx --tag flags + a comma-separated list for logs.
-          FLAGS=""
+          # Tags are applied by `docker buildx imagetools create` after the
+          # per-arch digest builds, not by buildx --tag. Emit a space-separated
+          # list (consumed by the manifest step) and a comma list (for the summary).
           LIST=""
           for t in "${TAGS[@]}"; do
-            FLAGS+=" --tag $t"
             LIST+="${t},"
           done
-          # GitHub output: use heredoc for multi-line safety
           {
-            echo "flags<<EOF"
-            echo "${FLAGS}"
-            echo "EOF"
             echo "list=${LIST%,}"
+            echo "list_space<<EOF"
+            echo "${TAGS[*]}"
+            echo "EOF"
           } >> "$GITHUB_OUTPUT"
           echo "Will tag: ${LIST%,}"
 
-      - name: Build and (maybe) push image
-        env:
-          PLATFORMS: ${{ steps.platforms.outputs.value }}
-          TAG_FLAGS: ${{ steps.tags.outputs.flags }}
+      # Why split per-arch? The old single `--platform amd64,arm64 --push`
+      # command hung for 30m on tag refs (run 26716392993) and was killed at the
+      # job timeout: a tag's gha cache is cold, so arm64 rebuilt from scratch under
+      # QEMU emulation (which routinely hangs), and the Release never got cut. The
+      # near-simultaneous main build of the same code finished in 4m on a warm
+      # cache. Fix: amd64 publishes natively + unconditionally; arm64 is best-effort
+      # under a hard time cap; a manifest list is assembled afterward from whatever
+      # digests exist. Publishing (and the Release) can no longer depend on arm64.
+
+      - name: Build + push amd64 by digest (required)
+        id: amd64
         run: |
-          PUSH_FLAG=""
-          OUTPUT_FLAG=""
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            PUSH_FLAG="--push"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: verify the image assembles; do not push.
+            docker buildx build \
+              --platform linux/amd64 \
+              --cache-from "type=gha,scope=amd64" \
+              --output "type=image,push=false" \
+              --file Dockerfile .
+            echo "PR build verified (amd64, not pushed)."
           else
-            # PR builds: just verify the image builds, do not push.
-            OUTPUT_FLAG="--output=type=image,push=false"
+            docker buildx build \
+              --platform linux/amd64 \
+              --cache-from "type=gha,scope=amd64" \
+              --cache-to "type=gha,scope=amd64,mode=max" \
+              --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file /tmp/amd64.json \
+              --file Dockerfile \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              .
+            digest="$(jq -r '."containerimage.digest"' /tmp/amd64.json)"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+            echo "amd64 digest: $digest"
           fi
 
-          # GitHub Actions cache backend for buildx layer cache.
-          # This works through the gha-cache service, not codeload.
-          docker buildx build \
-            $PUSH_FLAG \
-            $OUTPUT_FLAG \
-            --platform "$PLATFORMS" \
-            --cache-from "type=gha" \
-            --cache-to "type=gha,mode=max" \
-            $TAG_FLAGS \
-            --file Dockerfile \
-            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            .
+      - name: Build + push arm64 by digest (best-effort, capped)
+        id: arm64
+        # Only when QEMU installed cleanly, never on PRs, and never fatal: a slow
+        # or hung emulated build is killed by `timeout` and we publish amd64-only.
+        if: github.event_name != 'pull_request' && steps.qemu.outcome == 'success'
+        continue-on-error: true
+        run: |
+          if timeout 900 docker buildx build \
+              --platform linux/arm64 \
+              --cache-from "type=gha,scope=arm64" \
+              --cache-to "type=gha,scope=arm64,mode=max" \
+              --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file /tmp/arm64.json \
+              --file Dockerfile \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              . ; then
+            digest="$(jq -r '."containerimage.digest"' /tmp/arm64.json)"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+            echo "arm64 digest: $digest"
+          else
+            echo "::warning::arm64 build timed out (15m cap) or failed; publishing amd64-only this run. arm64 catches up once its cache warms."
+          fi
+
+      - name: Create + push manifest list
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.tags.outputs.list_space }}
+          AMD64_DIGEST: ${{ steps.amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ steps.arm64.outputs.digest }}
+        run: |
+          # amd64 always present; arm64 only if its step produced a digest.
+          SRCS="${IMAGE}@${AMD64_DIGEST}"
+          if [ -n "${ARM64_DIGEST}" ]; then
+            SRCS="${SRCS} ${IMAGE}@${ARM64_DIGEST}"
+            echo "Manifest: linux/amd64 + linux/arm64"
+          else
+            echo "Manifest: linux/amd64 only (arm64 absent this run)"
+          fi
+          TAGARGS=""
+          for t in ${TAGS}; do
+            TAGARGS="${TAGARGS} --tag ${t}"
+          done
+          docker buildx imagetools create ${TAGARGS} ${SRCS}
+          echo "Pushed tags: ${TAGS}"
 
       - name: Build single-arch image for local smoke test
         run: |
           # Local-load amd64 image so the next step can `docker run` it.
+          # Reuses the scope=amd64 cache from the publish step (near-instant).
           docker buildx build \
             --load \
             --platform linux/amd64 \
-            --cache-from "type=gha" \
+            --cache-from "type=gha,scope=amd64" \
             --tag cryptex:ci \
             --file Dockerfile \
             .
