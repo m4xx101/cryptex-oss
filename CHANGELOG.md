@@ -2,6 +2,22 @@
 
 All notable changes to Cryptex OSS land here. Format follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/). Versioning follows [SemVer](https://semver.org/).
 
+## [2.8.1] - 2026-06-10
+
+First published release of the 2.8 line. 2.8.0 was tagged but never shipped: the release build hung on the emulated arm64 image and was killed at the job timeout, so no image and no GitHub Release were ever produced. 2.8.1 fixes the release pipeline and carries every 2.8.0 change.
+
+### Fixed
+
+- **Release pipeline no longer hangs on the emulated arm64 build.** The multi-arch Docker build was a single `--platform amd64,arm64 --push` command; on tag refs its layer cache is cold, so arm64 rebuilt from scratch under QEMU emulation and stalled past the job timeout, taking the GitHub Release down with it. The build is now split: `linux/amd64` builds natively and publishes by digest unconditionally (image tags and the Release are cut from this leg alone), while `linux/arm64` builds best-effort under a hard time cap and is merged into the manifest only when it finishes. Per-architecture build caches keep repeat builds fast.
+
+### Note
+
+- 2.8.1 includes all of the 2.8.0 work: the v2.7.0 structured-output experiment and its three mutators were reverted for a clean technique set, the Adversarial Suffix and Glitch-Token labs gained run-against-target panels, the model picker is scoped to your configured providers, the tool-title rendering bug is fixed, and a mount-smoke test now gates interactivity in CI.
+
+### Image
+
+- `ghcr.io/m4xx101/cryptex-oss:v2.8.1` (`linux/amd64`, plus `linux/arm64` when the emulated build completes within its cap). `:latest`, `:v2.8`, `:2.8` track this tag.
+
 ## [2.8.0] - 2026-05-31
 
 Remediation release. The v2.7.0 structured-output experiment is reverted, two legacy labs become active (run-against-target), the tool-title rendering bug is fixed, and the model picker is now scoped to your configured providers. Pairs with the v2.7.1 hotfix that restored client interactivity.
@@ -25,7 +41,7 @@ Remediation release. The v2.7.0 structured-output experiment is reverted, two le
 
 ### Image
 
-- `ghcr.io/m4xx101/cryptex-oss:v2.8.0` (multi-arch `linux/amd64` + `linux/arm64`). `:latest`, `:v2.8`, `:2.8` track this tag.
+- Not published. The v2.8.0 release build hung on the emulated arm64 image and was cancelled at the job timeout, so no `:v2.8.0` image or GitHub Release was ever produced. These changes ship in [2.8.1].
 
 ## [2.7.1] - 2026-05-31
 

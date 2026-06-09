@@ -1,6 +1,6 @@
 {
   "name": "cryptex-oss",
-  "version": "2.8.0",
+  "version": "2.8.1",
   "description": "Open-source LLM red-teaming toolkit. 159 transforms, 25 tool surfaces, BYOK gateway. Static site, runs in your browser.",
   "scripts": {
     "build": "cd app && npm ci && npm run build",
